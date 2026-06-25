@@ -1,0 +1,74 @@
+{
+  "entities": {
+    "Account": {
+      "title": "Account",
+      "description": "A YouTube account connected via OAuth",
+      "type": "object",
+      "properties": {
+        "channelId": { "type": "string", "description": "YouTube channel ID" },
+        "displayName": { "type": "string", "description": "YouTube channel display name" },
+        "avatar": { "type": "string", "description": "YouTube channel avatar URL" },
+        "accessToken": { "type": "string", "description": "Google API OAuth access token" },
+        "refreshToken": { "type": "string", "description": "Google API OAuth refresh token" },
+        "tokenExpiry": { "type": "number", "description": "OAuth token expiry timestamp in ms" },
+        "createdAt": { "type": "number", "description": "Timestamp of connection" }
+      },
+      "required": ["channelId", "displayName", "accessToken", "refreshToken", "tokenExpiry", "createdAt"]
+    },
+    "Comment": {
+      "title": "Comment",
+      "description": "A comment template in the list of automated comments",
+      "type": "object",
+      "properties": {
+        "text": { "type": "string", "description": "The text of the comment" },
+        "createdAt": { "type": "number", "description": "Timestamp of creation" }
+      },
+      "required": ["text", "createdAt"]
+    },
+    "Setting": {
+      "title": "Setting",
+      "description": "Application settings for the commenter engine",
+      "type": "object",
+      "properties": {
+        "targetType": { "type": "string", "enum": ["live_chat", "video"], "description": "Target type for comments" },
+        "targetId": { "type": "string", "description": "YouTube Video ID or Live Stream ID" },
+        "interval": { "type": "number", "description": "Interval in seconds between comments" },
+        "rotation": { "type": "string", "enum": ["sequential", "random"], "description": "Account rotation style" },
+        "active": { "type": "boolean", "description": "Whether automation is currently active" }
+      },
+      "required": ["targetType", "targetId", "interval", "rotation", "active"]
+    },
+    "Log": {
+      "title": "Log",
+      "description": "An execution log entry for a comment post attempt",
+      "type": "object",
+      "properties": {
+        "timestamp": { "type": "number", "description": "Timestamp of action" },
+        "accountId": { "type": "string", "description": "ID of the account that posted" },
+        "accountName": { "type": "string", "description": "Name of the account that posted" },
+        "commentText": { "type": "string", "description": "Text of the comment" },
+        "status": { "type": "string", "enum": ["success", "failed"], "description": "Status of the comment post" },
+        "message": { "type": "string", "description": "Details of the result or error message" }
+      },
+      "required": ["timestamp", "accountId", "accountName", "commentText", "status", "message"]
+    }
+  },
+  "firestore": {
+    "accounts/{accountId}": {
+      "schema": "Account",
+      "description": "Collection of YouTube accounts"
+    },
+    "comments/{commentId}": {
+      "schema": "Comment",
+      "description": "Collection of automated comments"
+    },
+    "settings/{settingId}": {
+      "schema": "Setting",
+      "description": "Configuration settings"
+    },
+    "logs/{logId}": {
+      "schema": "Log",
+      "description": "Execution activity logs"
+    }
+  }
+}

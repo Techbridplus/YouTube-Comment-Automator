@@ -1,0 +1,6 @@
+{
+  "name": "YouTube Stream Commenter",
+  "description": "Automated commenting on YouTube videos and live streams using multiple Google accounts.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
