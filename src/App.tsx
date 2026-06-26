@@ -31,17 +31,8 @@ import {
   query, 
   orderBy 
 } from "firebase/firestore";
+import { signInWithPopup, GoogleAuthProvider, onAuthStateChanged, User } from "firebase/auth";
 import { db, auth } from "./firebase";
-import { 
-  signInWithEmailAndPassword, 
-  createUserWithEmailAndPassword, 
-  signOut, 
-  onAuthStateChanged,
-  sendPasswordResetEmail,
-  User as FirebaseUser,
-  GoogleAuthProvider,
-  signInWithPopup
-} from "firebase/auth";
 
 // Helper to extract YouTube video ID from various video/livestream URL patterns
 function extractYoutubeId(input: string): string {
@@ -67,6 +58,7 @@ interface YTAccount {
   id: string;
   channelId: string;
   displayName: string;
+  username?: string;
   avatar: string;
   createdAt: number;
 }
@@ -96,19 +88,13 @@ interface CommentSettings {
 }
 
 export default function App() {
-  // Auth state
-  const [currentUser, setCurrentUser] = useState<FirebaseUser | null>(null);
-  const [authLoading, setAuthLoading] = useState<boolean>(true);
-  const [authMode, setAuthMode] = useState<"login" | "signup" | "forgot">("login");
-  const [authEmail, setAuthEmail] = useState("");
-  const [authPassword, setAuthPassword] = useState("");
-  const [authError, setAuthError] = useState("");
-  const [authSuccess, setAuthSuccess] = useState("");
-  const [authSubmitting, setAuthSubmitting] = useState(false);
-
   // Configuration status
   const [googleConfigured, setGoogleConfigured] = useState<boolean>(false);
   const [googleClientId, setGoogleClientId] = useState<string>("");
+
+  // Auth State
+  const [user, setUser] = useState<User | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
 
   // DB entities state
   const [accounts, setAccounts] = useState<YTAccount[]>([]);
@@ -123,6 +109,7 @@ export default function App() {
   });
 
   // UI Local state
+  const [activeTab, setActiveTab] = useState<"automation" | "manual">("automation");
   const [newCommentText, setNewCommentText] = useState<string>("");
   const [geminiPrompt, setGeminiPrompt] = useState<string>("");
   const [spinning, setSpinning] = useState<boolean>(false);
@@ -145,77 +132,12 @@ export default function App() {
   };
 
   useEffect(() => {
-    checkConfig();
-
-    const unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
-      if (user) {
-        setCurrentUser(user);
-        
-        // Firestore Sync listeners scoped to users/{uid}
-        const unsubscribeAccounts = onSnapshot(collection(db, "users", user.uid, "accounts"), (snapshot) => {
-          const list = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as unknown as YTAccount));
-          setAccounts(list);
-        });
-
-        const unsubscribeComments = onSnapshot(collection(db, "users", user.uid, "comments"), (snapshot) => {
-          const list = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as unknown as CommentItem));
-          list.sort((a, b) => b.createdAt - a.createdAt);
-          setComments(list);
-        });
-
-        const unsubscribeLogs = onSnapshot(
-          query(collection(db, "users", user.uid, "logs"), orderBy("timestamp", "desc")),
-          (snapshot) => {
-            const list = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as unknown as ActivityLog));
-            setLogs(list);
-          }
-        );
-
-        // Fetch settings or create if not exists
-        const settingsRef = doc(db, "users", user.uid);
-        const unsubscribeSettings = onSnapshot(settingsRef, async (snap) => {
-          if (snap.exists()) {
-            setSettings(snap.data() as CommentSettings);
-          } else {
-            const defaultSettings: CommentSettings = {
-              targetType: "live_chat",
-              targetId: "",
-              interval: 15,
-              rotation: "sequential",
-              active: false
-            };
-            await setDoc(settingsRef, defaultSettings);
-            setSettings(defaultSettings);
-          }
-          setLoading(false);
-        }, (err) => {
-          console.error("Error subscribing to settings:", err);
-          setLoading(false);
-        });
-
-        // Store unsubs so we can clear them on user change/logout
-        return () => {
-          unsubscribeAccounts();
-          unsubscribeComments();
-          unsubscribeLogs();
-          unsubscribeSettings();
-        };
-      } else {
-        setCurrentUser(null);
-        setAccounts([]);
-        setComments([]);
-        setLogs([]);
-        setSettings({
-          targetType: "live_chat",
-          targetId: "",
-          interval: 15,
-          rotation: "sequential",
-          active: false
-        });
-        setLoading(false);
-      }
+    const unsubscribeAuth = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
       setAuthLoading(false);
     });
+
+    checkConfig();
 
     // Listener for successfully connected accounts via OAuth callback
     const handleAuthMessage = (event: MessageEvent) => {
@@ -232,80 +154,73 @@ export default function App() {
     };
   }, []);
 
-  // Submit signin/signup
-  const handleAuthSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setAuthError("");
-    setAuthSuccess("");
-    setAuthSubmitting(true);
-
-    try {
-      if (authMode === "login") {
-        await signInWithEmailAndPassword(auth, authEmail, authPassword);
-      } else if (authMode === "signup") {
-        await createUserWithEmailAndPassword(auth, authEmail, authPassword);
-        setAuthSuccess("Account created successfully!");
-      } else if (authMode === "forgot") {
-        await sendPasswordResetEmail(auth, authEmail);
-        setAuthSuccess("Password reset email sent!");
-      }
-    } catch (err: any) {
-      console.error("Auth error:", err);
-      let message = err.message || "Authentication failed.";
-      if (err.code === "auth/invalid-credential") {
-        message = "Invalid email or password.";
-      } else if (err.code === "auth/email-already-in-use") {
-        message = "This email is already registered.";
-      } else if (err.code === "auth/weak-password") {
-        message = "Password should be at least 6 characters.";
-      } else if (err.code === "auth/invalid-email") {
-        message = "Please enter a valid email address.";
-      }
-      setAuthError(message);
-    } finally {
-      setAuthSubmitting(false);
+  useEffect(() => {
+    if (!user) {
+      setLoading(false);
+      return;
     }
-  };
+    
+    // Firestore Sync listeners
+    const unsubscribeAccounts = onSnapshot(collection(db, "accounts"), (snapshot) => {
+      const list = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as unknown as YTAccount));
+      setAccounts(list);
+    });
 
-  // Sign out
-  const handleSignOut = async () => {
-    try {
-      await signOut(auth);
-    } catch (err) {
-      console.error("Failed to sign out:", err);
-    }
-  };
+    const unsubscribeComments = onSnapshot(collection(db, "comments"), (snapshot) => {
+      const list = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as unknown as CommentItem));
+      // Sort comments by creation date descending
+      list.sort((a, b) => b.createdAt - a.createdAt);
+      setComments(list);
+    });
 
-  // Google Authentication Sign In / Sign Up
-  const handleGoogleAuth = async () => {
-    setAuthError("");
-    setAuthSuccess("");
-    setAuthSubmitting(true);
-    try {
-      const provider = new GoogleAuthProvider();
-      await signInWithPopup(auth, provider);
-      setAuthSuccess("Signed in with Google successfully!");
-    } catch (err: any) {
-      console.error("Google Auth error:", err);
-      let message = err.message || "Google authentication failed.";
-      if (err.code === "auth/popup-blocked") {
-        message = "Popup blocked by your browser. Please allow popups for this site.";
-      } else if (err.code === "auth/cancelled-popup-request") {
-        message = "The sign-in popup was closed before completion.";
+    const unsubscribeLogs = onSnapshot(
+      query(collection(db, "logs"), orderBy("timestamp", "desc")),
+      (snapshot) => {
+        const list = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as unknown as ActivityLog));
+        setLogs(list);
       }
-      setAuthError(message);
-    } finally {
-      setAuthSubmitting(false);
-    }
-  };
+    );
+
+    const syncSettings = async () => {
+      try {
+        const settingsRef = doc(db, "settings", "global");
+        const snap = await getDoc(settingsRef);
+        if (snap.exists()) {
+          setSettings(snap.data() as CommentSettings);
+        } else {
+          // Initialize default settings in DB
+          const defaultSettings: CommentSettings = {
+            targetType: "live_chat",
+            targetId: "",
+            interval: 15,
+            rotation: "sequential",
+            active: false
+          };
+          await setDoc(settingsRef, defaultSettings);
+          setSettings(defaultSettings);
+        }
+      } catch (err) {
+        console.error("Error fetching settings:", err);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    syncSettings();
+
+    return () => {
+      unsubscribeAccounts();
+      unsubscribeComments();
+      unsubscribeLogs();
+    };
+  }, [user]);
 
   // Update Settings
   const saveSettings = async (updates: Partial<CommentSettings>) => {
-    if (!currentUser) return;
     const nextSettings = { ...settings, ...updates };
     setSettings(nextSettings);
     try {
-      await setDoc(doc(db, "users", currentUser.uid), nextSettings);
+      await setDoc(doc(db, "settings", "global"), nextSettings);
     } catch (err) {
       console.error("Failed to save settings:", err);
     }
@@ -314,10 +229,9 @@ export default function App() {
   // Add a single custom comment
   const handleAddComment = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!currentUser) return;
     if (!newCommentText.trim()) return;
     try {
-      await addDoc(collection(db, "users", currentUser.uid, "comments"), {
+      await addDoc(collection(db, "comments"), {
         text: newCommentText.trim(),
         createdAt: Date.now()
       });
@@ -332,9 +246,8 @@ export default function App() {
 
   // Delete a comment
   const handleDeleteComment = async (id: string) => {
-    if (!currentUser) return;
     try {
-      await deleteDoc(doc(db, "users", currentUser.uid, "comments", id));
+      await deleteDoc(doc(db, "comments", id));
     } catch (err) {
       console.error("Failed to delete comment:", err);
     }
@@ -342,9 +255,8 @@ export default function App() {
 
   // Remove a connected account
   const handleRemoveAccount = async (id: string) => {
-    if (!currentUser) return;
     try {
-      await deleteDoc(doc(db, "users", currentUser.uid, "accounts", id));
+      await deleteDoc(doc(db, "accounts", id));
       setSuccessMsg("Account disconnected.");
       setTimeout(() => setSuccessMsg(""), 3000);
     } catch (err) {
@@ -354,10 +266,9 @@ export default function App() {
 
   // Trigger Google OAuth Login Popup
   const handleConnectAccount = async () => {
-    if (!currentUser) return;
     try {
       const origin = window.location.origin;
-      const response = await fetch(`/api/auth/url?origin=${encodeURIComponent(origin)}&state=${currentUser.uid}`);
+      const response = await fetch(`/api/auth/url?origin=${encodeURIComponent(origin)}`);
       if (!response.ok) {
         throw new Error("Failed to get authorization URL from backend.");
       }
@@ -380,11 +291,10 @@ export default function App() {
 
   // Clear Activity Logs
   const handleClearLogs = async () => {
-    if (!currentUser) return;
     try {
-      const logsSnap = await getDocs(collection(db, "users", currentUser.uid, "logs"));
+      const logsSnap = await getDocs(collection(db, "logs"));
       for (const logDoc of logsSnap.docs) {
-        await deleteDoc(doc(db, "users", currentUser.uid, "logs", logDoc.id));
+        await deleteDoc(doc(db, "logs", logDoc.id));
       }
     } catch (err) {
       console.error("Failed to clear logs:", err);
@@ -393,18 +303,13 @@ export default function App() {
 
   // Generate comment variations using Gemini
   const handleSpinComments = async () => {
-    if (!currentUser) return;
     if (!geminiPrompt.trim()) return;
     setSpinning(true);
     setErrorMsg("");
     try {
-      const idToken = await currentUser.getIdToken();
       const response = await fetch("/api/generate-variations", {
         method: "POST",
-        headers: { 
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${idToken}`
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ prompt: geminiPrompt.trim() })
       });
 
@@ -415,8 +320,9 @@ export default function App() {
 
       const { variations } = await response.json();
       if (Array.isArray(variations) && variations.length > 0) {
+        // Save all generated variations to DB
         for (const variation of variations) {
-          await addDoc(collection(db, "users", currentUser.uid, "comments"), {
+          await addDoc(collection(db, "comments"), {
             text: variation,
             createdAt: Date.now()
           });
@@ -465,217 +371,54 @@ export default function App() {
     setTimeout(() => setSuccessMsg(""), 4000);
   };
 
-  if (authLoading) {
+  const handleLogin = async () => {
+    const provider = new GoogleAuthProvider();
+    try {
+      await signInWithPopup(auth, provider);
+    } catch (err: any) {
+      console.error("Login failed:", err);
+      setErrorMsg(err.message || "Failed to log in.");
+    }
+  };
+
+  if (authLoading || loading) {
     return (
       <div className="flex flex-col items-center justify-center min-h-screen bg-slate-950 text-slate-100">
         <RefreshCw className="w-12 h-12 text-rose-500 animate-spin mb-4" />
-        <p className="text-slate-400 font-medium font-sans">Initializing StreamCast Automation Studio...</p>
+        <p className="text-slate-400 font-medium">Initializing StreamCast Automation Studio...</p>
       </div>
     );
   }
 
-  if (!currentUser) {
+  if (!user) {
     return (
-      <div className="min-h-screen bg-slate-950 flex flex-col justify-center items-center p-4 font-sans relative overflow-hidden">
-        {/* Decorative background blurs */}
-        <div className="absolute top-1/4 left-1/4 w-96 h-96 bg-rose-500/10 rounded-full blur-3xl pointer-events-none"></div>
-        <div className="absolute bottom-1/4 right-1/4 w-96 h-96 bg-amber-500/10 rounded-full blur-3xl pointer-events-none"></div>
-
-        <div className="w-full max-w-md z-10">
-          {/* Header Branding */}
-          <div className="flex flex-col items-center mb-8">
-            <div className="bg-rose-500/10 p-3.5 rounded-2xl border border-rose-500/20 mb-3 shadow-inner">
-              <Youtube className="w-10 h-10 text-rose-500" />
+      <div className="flex flex-col items-center justify-center min-h-screen bg-slate-950 text-slate-100 p-4">
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-8 max-w-md w-full text-center shadow-2xl">
+          <div className="bg-rose-500/10 p-3 rounded-xl border border-rose-500/20 w-16 h-16 mx-auto mb-6 flex items-center justify-center">
+            <Youtube className="w-8 h-8 text-rose-500" />
+          </div>
+          <h1 className="text-2xl font-bold tracking-tight text-white mb-2">StreamCast Studio</h1>
+          <p className="text-slate-400 mb-8 text-sm">Sign in to access your YouTube automation dashboard and manage your account pool.</p>
+          
+          {errorMsg && (
+            <div className="bg-rose-500/10 border border-rose-500/30 rounded-lg p-3 mb-6 text-rose-300 text-sm">
+              {errorMsg}
             </div>
-            <h1 className="text-3xl font-extrabold tracking-tight bg-gradient-to-r from-rose-500 via-pink-500 to-amber-500 bg-clip-text text-transparent">
-              StreamCast
-            </h1>
-            <p className="text-sm text-slate-400 mt-1 font-medium">YouTube Live Stream Automation Studio</p>
-          </div>
+          )}
 
-          {/* Card Body */}
-          <div className="bg-slate-900/60 border border-slate-800 backdrop-blur-xl rounded-2xl p-6 md:p-8 shadow-2xl">
-            {authMode !== "forgot" && (
-              <div className="flex border-b border-slate-800 mb-6 p-0.5 bg-slate-950/60 rounded-lg">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setAuthMode("login");
-                    setAuthError("");
-                    setAuthSuccess("");
-                  }}
-                  className={`flex-1 py-2 text-sm font-semibold rounded-md transition-all ${
-                    authMode === "login"
-                      ? "bg-slate-800 text-slate-100 shadow-sm border border-slate-700/50"
-                      : "text-slate-400 hover:text-slate-200"
-                  }`}
-                >
-                  Sign In
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setAuthMode("signup");
-                    setAuthError("");
-                    setAuthSuccess("");
-                  }}
-                  className={`flex-1 py-2 text-sm font-semibold rounded-md transition-all ${
-                    authMode === "signup"
-                      ? "bg-slate-800 text-slate-100 shadow-sm border border-slate-700/50"
-                      : "text-slate-400 hover:text-slate-200"
-                  }`}
-                >
-                  Create Account
-                </button>
-              </div>
-            )}
-
-            <h2 className="text-xl font-bold text-slate-100 mb-2">
-              {authMode === "login" && "Welcome Back"}
-              {authMode === "signup" && "Get Started"}
-              {authMode === "forgot" && "Reset Password"}
-            </h2>
-            <p className="text-xs text-slate-400 mb-6">
-              {authMode === "login" && "Access your secure automation dashboard and stream logs."}
-              {authMode === "signup" && "Create a secure account to persist comment templates and streams."}
-              {authMode === "forgot" && "Enter your email address and we'll send you a password reset link."}
-            </p>
-
-            {authError && (
-              <div className="mb-4 p-3 bg-red-500/10 border border-red-500/20 rounded-lg flex items-start gap-2.5 text-xs text-red-400">
-                <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
-                <span>{authError}</span>
-              </div>
-            )}
-
-            {authSuccess && (
-              <div className="mb-4 p-3 bg-emerald-500/10 border border-emerald-500/20 rounded-lg flex items-start gap-2.5 text-xs text-emerald-400">
-                <CheckCircle className="w-4 h-4 shrink-0 mt-0.5" />
-                <span>{authSuccess}</span>
-              </div>
-            )}
-
-            <form onSubmit={handleAuthSubmit} className="space-y-4">
-              <div>
-                <label className="block text-xs font-semibold text-slate-400 mb-1.5 uppercase tracking-wider">
-                  Email Address
-                </label>
-                <input
-                  type="email"
-                  required
-                  value={authEmail}
-                  onChange={(e) => setAuthEmail(e.target.value)}
-                  placeholder="name@domain.com"
-                  className="w-full bg-slate-950/80 border border-slate-800 rounded-lg py-2 px-3 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-rose-500 focus:ring-1 focus:ring-rose-500 transition-colors"
-                />
-              </div>
-
-              {authMode !== "forgot" && (
-                <div>
-                  <div className="flex justify-between items-center mb-1.5">
-                    <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                      Password
-                    </label>
-                    {authMode === "login" && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setAuthMode("forgot");
-                          setAuthError("");
-                          setAuthSuccess("");
-                        }}
-                        className="text-xs text-rose-400 hover:text-rose-300 transition-colors font-medium"
-                      >
-                        Forgot?
-                      </button>
-                    )}
-                  </div>
-                  <input
-                    type="password"
-                    required
-                    value={authPassword}
-                    onChange={(e) => setAuthPassword(e.target.value)}
-                    placeholder="••••••••"
-                    className="w-full bg-slate-950/80 border border-slate-800 rounded-lg py-2 px-3 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-rose-500 focus:ring-1 focus:ring-rose-500 transition-colors"
-                  />
-                </div>
-              )}
-
-              <button
-                type="submit"
-                disabled={authSubmitting}
-                className="w-full bg-gradient-to-r from-rose-600 to-amber-600 hover:from-rose-500 hover:to-amber-500 text-white font-semibold py-2.5 px-4 rounded-lg shadow-lg hover:shadow-rose-500/10 transition-all focus:ring-2 focus:ring-rose-500 disabled:opacity-50 disabled:cursor-not-allowed text-sm flex items-center justify-center gap-2"
-              >
-                {authSubmitting ? (
-                  <RefreshCw className="w-4 h-4 animate-spin" />
-                ) : (
-                  <>
-                    {authMode === "login" && "Sign In"}
-                    {authMode === "signup" && "Create Account"}
-                    {authMode === "forgot" && "Send Reset Link"}
-                  </>
-                )}
-              </button>
-            </form>
-
-            {authMode !== "forgot" && (
-              <>
-                <div className="relative my-6">
-                  <div className="absolute inset-0 flex items-center">
-                    <span className="w-full border-t border-slate-800" />
-                  </div>
-                  <div className="relative flex justify-center text-xs uppercase">
-                    <span className="bg-slate-900/60 px-2 text-slate-500">Or continue with</span>
-                  </div>
-                </div>
-
-                <button
-                  type="button"
-                  onClick={handleGoogleAuth}
-                  disabled={authSubmitting}
-                  className="w-full flex items-center justify-center gap-2.5 bg-slate-950 hover:bg-slate-900 text-slate-200 border border-slate-800 rounded-lg py-2.5 px-4 font-semibold text-sm transition-all focus:ring-2 focus:ring-rose-500 disabled:opacity-50"
-                >
-                  <svg className="w-4.5 h-4.5 shrink-0" viewBox="0 0 24 24">
-                    <path
-                      fill="#EA4335"
-                      d="M12.24 10.285V14.4h6.887c-.275 1.565-1.88 4.604-6.887 4.604-4.33 0-7.866-3.577-7.866-8s3.536-8 7.866-8c2.46 0 4.105 1.025 5.047 1.926l3.227-3.107C18.215 1.54 15.42 1 12.24 1 6.01 1 1 5.923 1 12s5.01 11 11.24 11c6.5 0 10.82-4.51 10.82-10.82 0-.73-.08-1.285-.177-1.895H12.24z"
-                    />
-                  </svg>
-                  <span>Continue with Google</span>
-                </button>
-              </>
-            )}
-
-            {authMode === "forgot" && (
-              <div className="mt-6 text-center">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setAuthMode("login");
-                    setAuthError("");
-                    setAuthSuccess("");
-                  }}
-                  className="text-xs text-slate-400 hover:text-slate-200 transition-colors font-medium flex items-center justify-center gap-1 mx-auto"
-                >
-                  Back to Sign In
-                </button>
-              </div>
-            )}
-          </div>
-
-          <p className="text-center text-xs text-slate-600 mt-6">
-            Protected by multi-tier isolated database structures & Google Identity verification.
-          </p>
+          <button
+            onClick={handleLogin}
+            className="w-full flex items-center justify-center gap-3 bg-white hover:bg-slate-100 text-slate-900 font-bold py-3 px-4 rounded-xl transition-colors shadow-sm"
+          >
+            <svg className="w-5 h-5" viewBox="0 0 24 24">
+              <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4"/>
+              <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/>
+              <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/>
+              <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/>
+            </svg>
+            Continue with Google
+          </button>
         </div>
-      </div>
-    );
-  }
-
-  if (loading) {
-    return (
-      <div className="flex flex-col items-center justify-center min-h-screen bg-slate-950 text-slate-100">
-        <RefreshCw className="w-12 h-12 text-rose-500 animate-spin mb-4" />
-        <p className="text-slate-400 font-medium font-sans">Syncing StreamCast workspace...</p>
       </div>
     );
   }
@@ -698,6 +441,25 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-4">
+            <div className="hidden md:flex bg-slate-900 border border-slate-800 rounded-lg p-1">
+              <button
+                onClick={() => setActiveTab("automation")}
+                className={`px-4 py-1.5 text-sm font-medium rounded-md transition-colors ${
+                  activeTab === "automation" ? "bg-slate-800 text-white" : "text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                Engine
+              </button>
+              <button
+                onClick={() => setActiveTab("manual")}
+                className={`px-4 py-1.5 text-sm font-medium rounded-md transition-colors ${
+                  activeTab === "manual" ? "bg-slate-800 text-white" : "text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                Manual Reply
+              </button>
+            </div>
+
             {/* Engine Status Badge */}
             <div className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold border ${
               settings.active 
@@ -716,28 +478,42 @@ export default function App() {
               <RefreshCw className="w-4 h-4" />
             </button>
 
-            {/* User Profile / Email & Sign Out */}
-            <div className="hidden md:flex flex-col items-end text-right border-l border-slate-800 pl-4">
-              <span className="text-xs text-slate-300 font-medium">{currentUser?.email}</span>
-              <span className="text-[10px] text-slate-500 font-mono">ID: {currentUser?.uid.slice(0, 8)}</span>
-            </div>
-
-            <button
-              onClick={handleSignOut}
-              className="p-1.5 text-slate-400 hover:text-rose-400 hover:bg-slate-800 rounded-lg transition-colors border border-transparent hover:border-slate-700"
-              title="Sign Out"
+            <button 
+              onClick={() => auth.signOut()} 
+              className="p-1.5 text-slate-400 hover:text-slate-200 hover:bg-slate-800 rounded-lg transition-colors border border-transparent hover:border-slate-700"
+              title="Log out"
             >
               <LogOut className="w-4 h-4" />
             </button>
           </div>
         </div>
+        {/* Mobile Tabs */}
+        <div className="md:hidden flex border-t border-slate-800 bg-slate-950">
+           <button
+            onClick={() => setActiveTab("automation")}
+            className={`flex-1 py-3 text-sm font-medium transition-colors ${
+              activeTab === "automation" ? "text-rose-400 border-b-2 border-rose-500" : "text-slate-400"
+            }`}
+          >
+            Engine
+          </button>
+          <button
+            onClick={() => setActiveTab("manual")}
+            className={`flex-1 py-3 text-sm font-medium transition-colors ${
+              activeTab === "manual" ? "text-rose-400 border-b-2 border-rose-500" : "text-slate-400"
+            }`}
+          >
+            Manual Reply
+          </button>
+        </div>
       </header>
 
       {/* Main Container */}
-      <main className="flex-1 max-w-7xl w-full mx-auto p-4 md:p-6 grid grid-cols-1 lg:grid-cols-12 gap-6">
-        
-        {/* Left Column: Configuration & Accounts (7 cols) */}
-        <div className="lg:col-span-7 flex flex-col gap-6">
+      <main className="flex-1 max-w-7xl w-full mx-auto p-4 md:p-6">
+        {activeTab === "automation" ? (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+            {/* Left Column: Configuration & Accounts (7 cols) */}
+            <div className="lg:col-span-7 flex flex-col gap-6">
 
           {/* Setup Alerts & Warnings */}
           {!googleConfigured && (
@@ -1094,9 +870,11 @@ export default function App() {
               )}
             </div>
           </section>
-
         </div>
-
+      </div>
+    ) : (
+      <ManualReplyHub accounts={accounts} settings={settings} />
+    )}
       </main>
 
       {/* Activity Logs Panel - Spanning full width at the bottom */}
@@ -1147,6 +925,167 @@ export default function App() {
           </div>
         </div>
       </footer>
+    </div>
+  );
+}
+
+function ManualReplyHub({ accounts, settings }: { accounts: YTAccount[], settings: CommentSettings }) {
+  const [searchTerm, setSearchTerm] = useState("");
+  const [selectedAccount, setSelectedAccount] = useState<YTAccount | null>(null);
+  const [commentText, setCommentText] = useState("");
+  const [isPosting, setIsPosting] = useState(false);
+  const [statusMsg, setStatusMsg] = useState<{type: "error" | "success", msg: string} | null>(null);
+
+  const filteredAccounts = accounts.filter(acc => 
+    acc.displayName.toLowerCase().includes(searchTerm.toLowerCase()) ||
+    (acc.username && acc.username.toLowerCase().includes(searchTerm.toLowerCase()))
+  );
+
+  const handlePost = async () => {
+    if (!selectedAccount) return;
+    if (!commentText.trim()) {
+      setStatusMsg({ type: "error", msg: "Comment text cannot be empty." });
+      return;
+    }
+    if (!settings.targetId) {
+      setStatusMsg({ type: "error", msg: "Target video ID is missing in Engine settings." });
+      return;
+    }
+
+    setIsPosting(true);
+    setStatusMsg(null);
+    try {
+      const res = await fetch("/api/post-comment-manual", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          accountId: selectedAccount.id,
+          targetId: settings.targetId,
+          targetType: settings.targetType,
+          commentText
+        })
+      });
+
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Failed to post comment");
+      
+      setStatusMsg({ type: "success", msg: "Comment posted successfully!" });
+      setCommentText("");
+    } catch (err: any) {
+      setStatusMsg({ type: "error", msg: err.message });
+    } finally {
+      setIsPosting(false);
+    }
+  };
+
+  return (
+    <div className="max-w-3xl mx-auto space-y-6">
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-lg">
+        <h2 className="text-xl font-bold text-white mb-2">Account Checker & Manual Reply</h2>
+        <p className="text-sm text-slate-400 mb-6">
+          Paste an account name below to verify if it exists in your pool, then reply directly as that account.
+        </p>
+
+        <div className="space-y-4">
+          <div>
+            <label className="block text-xs font-bold uppercase tracking-wider text-slate-400 mb-2">
+              Search Account Name
+            </label>
+            <input
+              type="text"
+              placeholder="e.g. John Doe"
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              className="w-full bg-slate-950 border border-slate-800 rounded-lg px-4 py-3 text-sm text-slate-200 focus:outline-none focus:border-rose-500 transition-colors placeholder:text-slate-600"
+            />
+          </div>
+
+          {searchTerm && (
+            <div className="bg-slate-950 border border-slate-800 rounded-lg max-h-60 overflow-y-auto p-2 space-y-1">
+              {filteredAccounts.length > 0 ? (
+                filteredAccounts.map(acc => (
+                  <button
+                    key={acc.id}
+                    onClick={() => {
+                      setSelectedAccount(acc);
+                      setSearchTerm("");
+                    }}
+                    className="w-full flex items-center justify-between p-3 rounded-lg hover:bg-slate-900 transition-colors text-left"
+                  >
+                    <div className="flex items-center gap-3">
+                      <img src={acc.avatar || "https://api.dicebear.com/7.x/avataaars/svg?seed=" + acc.displayName} alt="" className="w-8 h-8 rounded-full bg-slate-800" />
+                      <div className="flex flex-col">
+                        <span className="text-sm font-medium text-slate-200">{acc.displayName}</span>
+                        {acc.username && <span className="text-xs text-slate-500">{acc.username}</span>}
+                      </div>
+                    </div>
+                    <span className="text-xs text-rose-400 font-medium bg-rose-500/10 px-2 py-1 rounded">Select</span>
+                  </button>
+                ))
+              ) : (
+                <div className="p-4 text-center text-sm text-slate-500">
+                  No accounts found matching "{searchTerm}"
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {selectedAccount && (
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-lg animate-in fade-in slide-in-from-bottom-4 duration-300">
+          <div className="flex items-center gap-4 mb-6 pb-6 border-b border-slate-800">
+            <img src={selectedAccount.avatar || "https://api.dicebear.com/7.x/avataaars/svg?seed=" + selectedAccount.displayName} alt="" className="w-12 h-12 rounded-full bg-slate-800 border-2 border-slate-700" />
+            <div>
+              <h3 className="text-lg font-bold text-white">{selectedAccount.displayName}</h3>
+              <p className="text-xs text-slate-400">Selected for manual reply</p>
+            </div>
+            <button 
+              onClick={() => setSelectedAccount(null)}
+              className="ml-auto text-xs text-slate-500 hover:text-slate-300 transition-colors"
+            >
+              Change Account
+            </button>
+          </div>
+
+          <div className="space-y-4">
+            <div>
+              <label className="block text-xs font-bold uppercase tracking-wider text-slate-400 mb-2">
+                Your Reply
+              </label>
+              <textarea
+                value={commentText}
+                onChange={(e) => setCommentText(e.target.value)}
+                placeholder="Write your response here..."
+                rows={4}
+                className="w-full bg-slate-950 border border-slate-800 rounded-lg p-4 text-sm text-slate-200 focus:outline-none focus:border-rose-500 transition-colors placeholder:text-slate-600 resize-none"
+              />
+            </div>
+
+            {statusMsg && (
+              <div className={`p-3 rounded-lg text-sm border ${
+                statusMsg.type === "success" 
+                  ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-400" 
+                  : "bg-rose-500/10 border-rose-500/30 text-rose-400"
+              }`}>
+                {statusMsg.msg}
+              </div>
+            )}
+
+            <button
+              onClick={handlePost}
+              disabled={isPosting || !commentText.trim()}
+              className="w-full bg-rose-500 hover:bg-rose-600 disabled:opacity-50 disabled:hover:bg-rose-500 text-white font-bold py-3 rounded-xl transition-colors flex items-center justify-center gap-2"
+            >
+              {isPosting ? <RefreshCw className="w-5 h-5 animate-spin" /> : <Play className="w-5 h-5" />}
+              {isPosting ? "Posting..." : "Post Reply"}
+            </button>
+            <p className="text-center text-[11px] text-slate-500 mt-2">
+              Will post to the target defined in Engine Settings ({settings.targetType}).
+            </p>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -1,35 +1,8 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // 1. Global Safety Net
-    match /{document=**} {
-      allow read, write: if false;
-    }
-
-    // Helpers
-    function isSignedIn() {
-      return request.auth != null;
-    }
-    
-    function isOwner(userId) {
-      return isSignedIn() && request.auth.uid == userId;
-    }
-
-    // 2. Secured User-Specific Data
-    match /users/{userId} {
-      allow read, write: if isOwner(userId);
-
-      match /accounts/{accountId} {
-        allow read, write: if isOwner(userId);
-      }
-
-      match /comments/{commentId} {
-        allow read, write: if isOwner(userId);
-      }
-
-      match /logs/{logId} {
-        allow read, write: if isOwner(userId);
-      }
+    match /{document=**} { 
+      allow read, write: if true; 
     }
   }
 }

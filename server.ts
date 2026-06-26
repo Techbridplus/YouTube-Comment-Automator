@@ -3,9 +3,21 @@ import path from "path";
 import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
-import { initializeApp, getApps } from "firebase-admin/app";
-import { getFirestore } from "firebase-admin/firestore";
-import { getAuth } from "firebase-admin/auth";
+import { initializeApp } from "firebase/app";
+import { 
+  getFirestore, 
+  doc, 
+  setDoc, 
+  getDoc, 
+  getDocs, 
+  collection, 
+  addDoc, 
+  updateDoc, 
+  deleteDoc, 
+  query, 
+  orderBy, 
+  limit 
+} from "firebase/firestore";
 
 // Initialize Express
 const app = express();
@@ -14,34 +26,30 @@ const PORT = 3000;
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Firebase Admin setup
-const projectId = "unified-verve-1mvz5";
+// Firebase setup
+const firebaseConfig = {
+  apiKey: "AIzaSyDiDbNRnSraWQN2xBgXLhVLxY74X1itetQ",
+  authDomain: "unified-verve-1mvz5.firebaseapp.com",
+  projectId: "unified-verve-1mvz5",
+  storageBucket: "unified-verve-1mvz5.firebasestorage.app",
+  messagingSenderId: "283912536690",
+  appId: "1:283912536690:web:d06ff167774985aedc78eb"
+};
 const databaseId = "ai-studio-a225123c-ec1d-47b3-a094-8fd973ff0172";
 
-if (getApps().length === 0) {
-  initializeApp({
-    projectId: projectId
-  });
-}
-const db = getFirestore(databaseId);
+const firebaseApp = initializeApp(firebaseConfig);
+const db = getFirestore(firebaseApp, databaseId);
 
-// User automation state tracking
-interface UserState {
-  lastPostedTime: number;
-  accountPointer: number;
-  commentPointer: number;
-}
-const userStates = new Map<string, UserState>();
+// Global commenter state
+let lastPostedTime = 0;
+let accountPointer = 0;
+let commentPointer = 0;
 
 // Helper to write activity log
-async function logActivity(userId: string, account: any, status: "success" | "failed", message: string) {
+async function logActivity(account: any, status: "success" | "failed", message: string) {
   try {
-    if (!userId) {
-      console.warn("logActivity called without userId, cannot write to Firestore. message:", message);
-      return;
-    }
-    const logsCol = db.collection("users").doc(userId).collection("logs");
-    await logsCol.add({
+    const logsCol = collection(db, "logs");
+    await addDoc(logsCol, {
       timestamp: Date.now(),
       accountId: account ? account.channelId : "system",
       accountName: account ? account.displayName : "System",
@@ -110,7 +118,7 @@ function extractYoutubeId(input: string): string {
 }
 
 // Helper to post comments to normal video or live stream
-async function executeCommentPost(userId: string, account: any, comment: string, settings: any) {
+async function executeCommentPost(account: any, comment: string, settings: any) {
   const targetId = extractYoutubeId(settings.targetId);
   const targetType = settings.targetType; // "live_chat" or "video"
   let accessToken = account.accessToken;
@@ -122,15 +130,15 @@ async function executeCommentPost(userId: string, account: any, comment: string,
       const refreshed = await refreshGoogleToken(account.refreshToken);
       accessToken = refreshed.accessToken;
       
-      const accountRef = db.collection("users").doc(userId).collection("accounts").doc(account.id);
-      await accountRef.update({
+      const accountRef = doc(db, "accounts", account.id);
+      await updateDoc(accountRef, {
         accessToken: refreshed.accessToken,
         tokenExpiry: refreshed.tokenExpiry
       });
       console.log(`Successfully refreshed token for channel ${account.displayName}.`);
     } catch (refreshErr: any) {
       const errMsg = `Failed to refresh OAuth token: ${refreshErr.message || refreshErr}`;
-      await logActivity(userId, account, "failed", errMsg);
+      await logActivity(account, "failed", errMsg);
       return;
     }
   }
@@ -185,7 +193,7 @@ async function executeCommentPost(userId: string, account: any, comment: string,
         throw new Error(`Live Chat Post failed: ${errText}`);
       }
 
-      await logActivity(userId, account, "success", `[Live Chat] Posted: "${comment}"`);
+      await logActivity(account, "success", `[Live Chat] Posted: "${comment}"`);
 
     } else {
       // Normal YouTube Video Comment
@@ -213,80 +221,71 @@ async function executeCommentPost(userId: string, account: any, comment: string,
         throw new Error(`Video Comment Post failed: ${errText}`);
       }
 
-      await logActivity(userId, account, "success", `[Video Comment] Posted: "${comment}"`);
+      await logActivity(account, "success", `[Video Comment] Posted: "${comment}"`);
     }
 
   } catch (err: any) {
     const errMsg = err.message || err;
-    await logActivity(userId, account, "failed", `Error posting: ${errMsg}`);
+    await logActivity(account, "failed", `Error posting: ${errMsg}`);
   }
 }
 
-// Background commenter loop checker (multi-user safe)
+// Background commenter loop checker
 async function checkAndPostComment() {
   try {
-    const usersSnap = await db.collection("users").where("active", "==", true).get();
+    const settingsRef = doc(db, "settings", "global");
+    const settingsSnap = await getDoc(settingsRef);
+    if (!settingsSnap.exists()) return;
     
-    for (const userDoc of usersSnap.docs) {
-      const userId = userDoc.id;
-      const settings = userDoc.data();
-      
-      if (!settings || !settings.active) continue;
+    const settings = settingsSnap.data();
+    if (!settings.active) return;
 
-      const intervalMs = (settings.interval || 10) * 1000;
-      const now = Date.now();
-      
-      let userState = userStates.get(userId);
-      if (!userState) {
-        userState = { lastPostedTime: 0, accountPointer: 0, commentPointer: 0 };
-        userStates.set(userId, userState);
-      }
+    const intervalMs = (settings.interval || 10) * 1000;
+    const now = Date.now();
+    if (now - lastPostedTime < intervalMs) return;
 
-      if (now - userState.lastPostedTime < intervalMs) continue;
+    // Fetch accounts
+    const accountsCol = collection(db, "accounts");
+    const accountsSnap = await getDocs(accountsCol);
+    const accounts = accountsSnap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
 
-      // Fetch accounts for this specific user
-      const accountsSnap = await db.collection("users").doc(userId).collection("accounts").get();
-      const accounts = accountsSnap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    if (accounts.length === 0) {
+      await logActivity(null, "failed", "No connected YouTube accounts. Automation paused.");
+      await updateDoc(settingsRef, { active: false });
+      return;
+    }
 
-      if (accounts.length === 0) {
-        await logActivity(userId, null, "failed", "No connected YouTube accounts. Automation paused.");
-        await db.collection("users").doc(userId).update({ active: false });
-        continue;
-      }
+    // Fetch comments
+    const commentsCol = collection(db, "comments");
+    const commentsSnap = await getDocs(commentsCol);
+    const comments = commentsSnap.docs.map(doc => doc.data().text);
 
-      // Fetch comments for this specific user
-      const commentsSnap = await db.collection("users").doc(userId).collection("comments").get();
-      const comments = commentsSnap.docs.map(doc => doc.data().text);
+    if (comments.length === 0) {
+      await logActivity(null, "failed", "No comments in pool. Please add comments.");
+      await updateDoc(settingsRef, { active: false });
+      return;
+    }
 
-      if (comments.length === 0) {
-        await logActivity(userId, null, "failed", "No comments in pool. Please add comments.");
-        await db.collection("users").doc(userId).update({ active: false });
-        continue;
-      }
+    // Post in parallel for all accounts
+    lastPostedTime = now;
 
-      // Select account and comment
-      let accountIndex = 0;
+    const postPromises = accounts.map(async (account, index) => {
       let commentIndex = 0;
-
       if (settings.rotation === "random") {
-        accountIndex = Math.floor(Math.random() * accounts.length);
         commentIndex = Math.floor(Math.random() * comments.length);
       } else {
-        accountIndex = userState.accountPointer % accounts.length;
-        commentIndex = userState.commentPointer % comments.length;
-        userState.accountPointer++;
-        userState.commentPointer++;
+        commentIndex = (commentPointer + index) % comments.length;
       }
-
-      const selectedAccount = accounts[accountIndex];
+      
       const selectedComment = comments[commentIndex];
+      await executeCommentPost(account, selectedComment, settings);
+    });
 
-      // Throttle / Save last post time
-      userState.lastPostedTime = now;
-
-      // Post it!
-      await executeCommentPost(userId, selectedAccount, selectedComment, settings);
+    if (settings.rotation !== "random") {
+      commentPointer += accounts.length;
     }
+
+    await Promise.all(postPromises);
 
   } catch (error: any) {
     console.error("Background commenter worker execution error:", error);
@@ -311,7 +310,6 @@ app.get("/api/config", (req, res) => {
 app.get("/api/auth/url", (req, res) => {
   const googleClientId = process.env.GOOGLE_CLIENT_ID;
   const origin = req.query.origin || process.env.APP_URL;
-  const state = req.query.state || ""; // This is the userId
 
   if (!googleClientId) {
     return res.status(500).json({ error: "Google Client ID is not configured." });
@@ -325,8 +323,7 @@ app.get("/api/auth/url", (req, res) => {
     response_type: "code",
     scope: "https://www.googleapis.com/auth/youtube.force-ssl https://www.googleapis.com/auth/userinfo.profile",
     access_type: "offline",
-    prompt: "consent",
-    state: state as string
+    prompt: "consent"
   });
 
   const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
@@ -335,7 +332,7 @@ app.get("/api/auth/url", (req, res) => {
 
 // 3. OAuth callback handler
 app.get(["/api/auth/callback", "/api/auth/callback/"], async (req, res) => {
-  const { code, state } = req.query; // state is the userId
+  const { code } = req.query;
   
   let origin = process.env.APP_URL;
   if (!origin) {
@@ -349,10 +346,6 @@ app.get(["/api/auth/callback", "/api/auth/callback/"], async (req, res) => {
 
   if (!code) {
     return res.status(400).send("Authorization code is missing.");
-  }
-
-  if (!state) {
-    return res.status(400).send("User reference state is missing.");
   }
 
   try {
@@ -393,6 +386,7 @@ app.get(["/api/auth/callback", "/api/auth/callback/"], async (req, res) => {
     let displayName = "YouTube User";
     let avatar = "";
     let channelId = "unknown";
+    let username = "";
 
     if (profileRes.ok) {
       const profileData: any = await profileRes.json();
@@ -413,6 +407,9 @@ app.get(["/api/auth/callback", "/api/auth/callback/"], async (req, res) => {
           const ytChannel = ytData.items[0];
           channelId = ytChannel.id;
           displayName = ytChannel.snippet.title;
+          if (ytChannel.snippet.customUrl) {
+            username = ytChannel.snippet.customUrl;
+          }
           if (ytChannel.snippet.thumbnails && ytChannel.snippet.thumbnails.default) {
             avatar = ytChannel.snippet.thumbnails.default.url;
           }
@@ -427,10 +424,10 @@ app.get(["/api/auth/callback", "/api/auth/callback/"], async (req, res) => {
     // otherwise warn the user to disconnect and reconnect with consent.
     let finalRefreshToken = refreshToken;
     
-    const accountDocRef = db.collection("users").doc(state as string).collection("accounts").doc(channelId);
-    const existingSnap = await accountDocRef.get();
-    if (!finalRefreshToken && existingSnap.exists) {
-      finalRefreshToken = existingSnap.data()?.refreshToken;
+    const accountDocRef = doc(db, "accounts", channelId);
+    const existingSnap = await getDoc(accountDocRef);
+    if (!finalRefreshToken && existingSnap.exists()) {
+      finalRefreshToken = existingSnap.data().refreshToken;
     }
 
     if (!finalRefreshToken) {
@@ -447,9 +444,10 @@ app.get(["/api/auth/callback", "/api/auth/callback/"], async (req, res) => {
     }
 
     // Save/Update Account in Firestore
-    await accountDocRef.set({
+    await setDoc(accountDocRef, {
       channelId,
       displayName,
+      username,
       avatar,
       accessToken,
       refreshToken: finalRefreshToken,
@@ -457,7 +455,7 @@ app.get(["/api/auth/callback", "/api/auth/callback/"], async (req, res) => {
       createdAt: Date.now()
     });
 
-    await logActivity(state as string, { channelId, displayName }, "success", "YouTube channel authenticated successfully.");
+    await logActivity({ channelId, displayName }, "success", "YouTube channel authenticated successfully.");
 
     // Send success postMessage and close the window
     res.send(`
@@ -486,23 +484,35 @@ app.get(["/api/auth/callback", "/api/auth/callback/"], async (req, res) => {
   }
 });
 
+app.post("/api/post-comment-manual", async (req, res) => {
+  try {
+    const { accountId, targetId, targetType, commentText } = req.body;
+    if (!accountId || !targetId || !targetType || !commentText) {
+      return res.status(400).json({ error: "Missing required fields." });
+    }
+
+    const accountRef = doc(db, "accounts", accountId);
+    const accountSnap = await getDoc(accountRef);
+    if (!accountSnap.exists()) {
+      return res.status(404).json({ error: "Account not found." });
+    }
+
+    const accountData = { id: accountSnap.id, ...accountSnap.data() };
+    const settings = { targetId, targetType };
+
+    await executeCommentPost(accountData, commentText, settings);
+    res.json({ success: true, message: "Comment posted successfully." });
+  } catch (error: any) {
+    console.error("Manual post error:", error);
+    res.status(500).json({ error: error.message || "Failed to post comment." });
+  }
+});
+
 // 4. Gemini Comment Spinner API
 app.post("/api/generate-variations", async (req, res) => {
   const { prompt } = req.body;
   if (!prompt) {
     return res.status(400).json({ error: "Base comment prompt is required." });
-  }
-
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return res.status(401).json({ error: "Unauthorized. Missing authorization token." });
-  }
-  const idToken = authHeader.split(" ")[1];
-  try {
-    await getAuth().verifyIdToken(idToken);
-  } catch (err: any) {
-    console.error("Auth verification failed for generate-variations:", err);
-    return res.status(401).json({ error: "Unauthorized. Invalid authorization token." });
   }
 
   const geminiKey = process.env.GEMINI_API_KEY;
